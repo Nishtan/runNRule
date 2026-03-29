@@ -42,100 +42,52 @@ function cellBoundaryToGeoJSON(h3index) {
   return { type: "Polygon", coordinates: [coords] };
 }
 
-// ── Geographic interpolation between two GPS pings ───────────────────────────
-// Instead of using H3's gridPathCells (which finds the shortest H3-grid path,
-// ignoring real-world geometry), we walk the actual line segment between the
-// two lat/lng coordinates and sample every H3 cell the segment passes through.
-//
-// This is what Strava-style apps do: the GPS trace is the ground truth.
-// If you walked a curve, the cells you actually passed through are captured —
-// not the cells along the shortest H3 grid route.
-//
-// How it works:
-//   1. Estimate how many H3 cells apart the two points are (gridDistance).
-//   2. Sample (steps * 3) evenly-spaced points along the line segment.
-//      Oversampling ensures we don't skip thin cells at oblique angles.
-//   3. Convert each sample to an H3 cell and deduplicate consecutive repeats.
-//   4. Return only the NEW cells (drop index 0 = fromCell, already in path).
-//
-// MAX_GAP_CELLS: if the two pings are more than this many H3 cells apart we
-// treat it as a GPS dropout and do NOT connect them — same as Strava's
-// "stationary gap" handling. Tweak as needed.
-const MAX_GAP_CELLS = 40; // ~360 m at res-12, ~1 km at res-11
+const MAX_GAP_CELLS = 40;
 
 function bridgeTo(fromCell, toCell, fromLng, fromLat, toLng, toLat, res) {
   if (fromCell === toCell) return [];
-
   const h3 = window.h3;
-
-  // Estimate grid distance to decide oversampling count and gap check
-  let gridDist = MAX_GAP_CELLS; // default: assume large if cross-face throws
+  let gridDist = MAX_GAP_CELLS;
   try { gridDist = h3.gridDistance(fromCell, toCell); } catch { /* cross-face */ }
-
-  // GPS dropout guard — don't bridge huge jumps (lifted finger, bad fix, etc.)
   if (gridDist > MAX_GAP_CELLS) return [];
-
-  // Number of sample points: oversample by 3× to avoid skipping thin cells
   const steps = Math.max(gridDist * 3, 6);
-
   const cells = [];
   let prevCell = fromCell;
-
   for (let i = 1; i <= steps; i++) {
     const t = i / steps;
     const lat = fromLat + (toLat - fromLat) * t;
     const lng = fromLng + (toLng - fromLng) * t;
-
     let cell;
-    try { cell = h3.latLngToCell(lat, lng, res); }
-    catch { continue; }
-
-    if (cell !== prevCell) {
-      cells.push(cell);
-      prevCell = cell;
-    }
+    try { cell = h3.latLngToCell(lat, lng, res); } catch { continue; }
+    if (cell !== prevCell) { cells.push(cell); prevCell = cell; }
   }
-
-  return cells; // fromCell already in path; toCell is naturally last if reached
+  return cells;
 }
 
-// ── Robust flood fill via BFS ─────────────────────────────────────────────────
 function floodFillInterior(ringSet) {
   if (ringSet.size === 0) return [];
   const h3 = window.h3;
   const ringArr = [...ringSet];
   const pivot = ringArr[0];
-
   let maxHops = 0;
   for (const cell of ringArr) {
-    try {
-      const d = h3.gridDistance(pivot, cell);
-      if (d > maxHops) maxHops = d;
-    } catch { /* cross-face, skip */ }
+    try { const d = h3.gridDistance(pivot, cell); if (d > maxHops) maxHops = d; } catch { /**/ }
   }
   const safeRadius = maxHops + 3;
-
   const boundingDisk = new Set(h3.gridDisk(pivot, safeRadius));
   for (const cell of ringArr) {
-    if (!boundingDisk.has(cell)) {
-      h3.gridDisk(cell, safeRadius).forEach((c) => boundingDisk.add(c));
-    }
+    if (!boundingDisk.has(cell)) h3.gridDisk(cell, safeRadius).forEach((c) => boundingDisk.add(c));
   }
-
   let seeds = [];
   try { seeds = h3.gridRingUnsafe(pivot, safeRadius); } catch { /**/ }
   if (!seeds || seeds.length === 0) {
     const inner = new Set(h3.gridDisk(pivot, safeRadius - 1));
     seeds = [...boundingDisk].filter((c) => !inner.has(c));
   }
-
   const exterior = new Set();
   const queue = [];
   for (const seed of seeds) {
-    if (!ringSet.has(seed) && boundingDisk.has(seed)) {
-      exterior.add(seed);
-      queue.push(seed);
-    }
+    if (!ringSet.has(seed) && boundingDisk.has(seed)) { exterior.add(seed); queue.push(seed); }
   }
   while (queue.length > 0) {
     const cell = queue.shift();
@@ -145,7 +97,6 @@ function floodFillInterior(ringSet) {
       queue.push(nb);
     }
   }
-
   return [...boundingDisk].filter((c) => !ringSet.has(c) && !exterior.has(c));
 }
 
@@ -177,29 +128,27 @@ const SCORE_COLORS = [1, 2, 3, 4, 5, 6];
 export default function App() {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
+  const markerRef = useRef(null);          // Mapbox Marker for GPS dot
+  const watchIdRef = useRef(null);         // geolocation watchPosition id
   const stateRef = useRef({
-    path: [],        // flat, fully-bridged path — every consecutive pair is adjacent
-    pathIndex: {},   // h3id → first index in path (O(1) loop-closure lookup)
+    path: [],
+    pathIndex: {},
     scoredCells: {},
     circuitCount: 0,
     res: 12,
-    // ── Last known lat/lng (the "previous GPS ping") ──────────────────────
-    // We store the real map coordinates of the last processed ping so that
-    // bridgeTo can interpolate along the actual geographic segment instead of
-    // asking H3 for its grid shortest-path.
     lastLng: null,
     lastLat: null,
   });
-  const isDrawing = useRef(false);
   const mapReady = useRef(false);
+  const isRunningRef = useRef(false);      // mirrors isRunning state, avoids stale closure in GPS cb
 
   const [res, setRes] = useState(12);
   const [stats, setStats] = useState({ path: 0, circuits: 0, captured: 0, maxScore: 0 });
-  const [info, setInfo] = useState(
-    "Click and drag on the map to draw your path — close a loop to capture territory"
-  );
+  const [info, setInfo] = useState("Allow location access — your position will appear on the map");
   const [libsLoaded, setLibsLoaded] = useState(false);
-  const [hoveredCell, setHoveredCell] = useState(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [gpsReady, setGpsReady] = useState(false);   // true once we have ≥1 GPS fix
+  const [gpsAccuracy, setGpsAccuracy] = useState(null);
 
   useEffect(() => {
     loadLink("https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css");
@@ -222,14 +171,8 @@ export default function App() {
 
   const redraw = useCallback(() => {
     if (!mapReady.current || !mapRef.current) return;
-    mapRef.current.getSource("scored").setData({
-      type: "FeatureCollection",
-      features: buildScoredFeatures(stateRef.current.scoredCells),
-    });
-    mapRef.current.getSource("path").setData({
-      type: "FeatureCollection",
-      features: buildPathFeatures(stateRef.current.path),
-    });
+    mapRef.current.getSource("scored").setData({ type: "FeatureCollection", features: buildScoredFeatures(stateRef.current.scoredCells) });
+    mapRef.current.getSource("path").setData({ type: "FeatureCollection", features: buildPathFeatures(stateRef.current.path) });
     updateStats();
   }, [updateStats]);
 
@@ -237,10 +180,7 @@ export default function App() {
     if (!mapReady.current || !mapRef.current) return;
     mapRef.current.getSource("flash").setData({
       type: "FeatureCollection",
-      features: cells.map((h3id) => ({
-        type: "Feature", properties: {},
-        geometry: cellBoundaryToGeoJSON(h3id),
-      })),
+      features: cells.map((h3id) => ({ type: "Feature", properties: {}, geometry: cellBoundaryToGeoJSON(h3id) })),
     });
     setTimeout(() => {
       if (mapReady.current && mapRef.current)
@@ -248,84 +188,50 @@ export default function App() {
     }, 700);
   }, []);
 
-  const closeCircuit = useCallback(
-    (loopStartIdx, closingCell) => {
-      const st = stateRef.current;
+  const closeCircuit = useCallback((loopStartIdx, closingCell) => {
+    const st = stateRef.current;
+    const loop = st.path.slice(loopStartIdx);
+    const ringSet = new Set(loop);
+    const interior = floodFillInterior(ringSet);
+    interior.forEach((id) => { st.scoredCells[id] = (st.scoredCells[id] || 0) + 1; });
+    loop.forEach((id)     => { st.scoredCells[id] = (st.scoredCells[id] || 0) + 1; });
+    st.circuitCount++;
+    st.path = [closingCell];
+    st.pathIndex = { [closingCell]: 0 };
+    flashInterior(interior);
+    setInfo(`Circuit #${st.circuitCount} closed! ${interior.length} interior cells captured · reseeded ✓`);
+    redraw();
+  }, [flashInterior, redraw]);
 
-      // Ring = everything from loopStartIdx to current end (closingCell already appended)
-      const loop = st.path.slice(loopStartIdx);
-      const ringSet = new Set(loop);
-      const interior = floodFillInterior(ringSet);
-
-      interior.forEach((id) => { st.scoredCells[id] = (st.scoredCells[id] || 0) + 1; });
-      loop.forEach((id)     => { st.scoredCells[id] = (st.scoredCells[id] || 0) + 1; });
-      st.circuitCount++;
-
-      // Reseed fresh from the closing cell only
-      st.path = [closingCell];
-      st.pathIndex = { [closingCell]: 0 };
-      // lastLng/lastLat intentionally kept so next segment starts from the right coord
-
-      flashInterior(interior);
-      setInfo(`Circuit #${st.circuitCount} closed! ${interior.length} interior cells captured · reseeded ✓`);
-      redraw();
-    },
-    [flashInterior, redraw]
-  );
-
-  // ── addCell: geographic interpolation ────────────────────────────────────
-  // lng/lat are the REAL map coordinates of this ping.
-  // We call bridgeTo with both the H3 cells AND the raw coordinates so it can
-  // walk the actual geographic segment — not the H3 grid shortcut.
-  const addCell = useCallback(
-    (rawCell, lng, lat) => {
-      if (!rawCell) return;
-      const st = stateRef.current;
-
-      // Bootstrap: very first cell
-      if (st.path.length === 0) {
-        st.path.push(rawCell);
-        st.pathIndex[rawCell] = 0;
-        st.lastLng = lng;
-        st.lastLat = lat;
-        redraw();
-        return;
-      }
-
-      const tail = st.path[st.path.length - 1];
-      if (tail === rawCell) {
-        // Same H3 cell — still update coords so next bridge starts from here
-        st.lastLng = lng;
-        st.lastLat = lat;
-        return;
-      }
-
-      // Use stored previous coords for geographic interpolation
-      const fromLng = st.lastLng ?? lng;
-      const fromLat = st.lastLat ?? lat;
-
-      const bridge = bridgeTo(tail, rawCell, fromLng, fromLat, lng, lat, st.res);
-
-      // Update last coords BEFORE processing bridge so reseed after closeCircuit
-      // still has correct coordinates for the next segment
+  const addCell = useCallback((rawCell, lng, lat) => {
+    if (!rawCell) return;
+    const st = stateRef.current;
+    if (st.path.length === 0) {
+      st.path.push(rawCell);
+      st.pathIndex[rawCell] = 0;
       st.lastLng = lng;
       st.lastLat = lat;
-
-      for (const cell of bridge) {
-        if (st.pathIndex[cell] !== undefined) {
-          // Close the loop: append the closing cell, then trigger closure
-          st.path.push(cell);
-          closeCircuit(st.pathIndex[cell], cell);
-          return; // path reseeded inside closeCircuit; stop here
-        }
-        st.pathIndex[cell] = st.path.length;
-        st.path.push(cell);
-      }
-
       redraw();
-    },
-    [closeCircuit, redraw]
-  );
+      return;
+    }
+    const tail = st.path[st.path.length - 1];
+    if (tail === rawCell) { st.lastLng = lng; st.lastLat = lat; return; }
+    const fromLng = st.lastLng ?? lng;
+    const fromLat = st.lastLat ?? lat;
+    const bridge = bridgeTo(tail, rawCell, fromLng, fromLat, lng, lat, st.res);
+    st.lastLng = lng;
+    st.lastLat = lat;
+    for (const cell of bridge) {
+      if (st.pathIndex[cell] !== undefined) {
+        st.path.push(cell);
+        closeCircuit(st.pathIndex[cell], cell);
+        return;
+      }
+      st.pathIndex[cell] = st.path.length;
+      st.path.push(cell);
+    }
+    redraw();
+  }, [closeCircuit, redraw]);
 
   const resetAll = useCallback(() => {
     stateRef.current = {
@@ -343,9 +249,65 @@ export default function App() {
       );
     }
     updateStats();
-    setInfo("Click and drag on the map to draw your path — close a loop to capture territory");
+    setInfo("Press Start Run to begin capturing territory with your GPS");
   }, [updateStats]);
 
+  // ── GPS callback — always update marker; only capture area when running ───
+  const handleGPSPosition = useCallback((pos) => {
+    const { longitude: lng, latitude: lat, accuracy } = pos.coords;
+    setGpsAccuracy(Math.round(accuracy));
+    setGpsReady(true);
+
+    // Move the marker
+    if (markerRef.current) {
+      markerRef.current.setLngLat([lng, lat]);
+    }
+
+    // Center map on first fix only (or if very first load)
+    if (mapRef.current && !mapRef.current._hasCenteredOnUser) {
+      mapRef.current.flyTo({ center: [lng, lat], zoom: 17, duration: 1200 });
+      mapRef.current._hasCenteredOnUser = true;
+    }
+
+    // Area capture only while running
+    if (!isRunningRef.current) return;
+
+    const cell = (() => {
+      try { return window.h3.latLngToCell(lat, lng, stateRef.current.res); }
+      catch { return null; }
+    })();
+    if (cell) addCell(cell, lng, lat);
+  }, [addCell]);
+
+  const handleGPSError = useCallback((err) => {
+    console.warn("GPS error:", err);
+    setInfo("GPS error: " + err.message);
+  }, []);
+
+  // Start / stop run
+  const toggleRun = useCallback(() => {
+    setIsRunning((prev) => {
+      const next = !prev;
+      isRunningRef.current = next;
+      if (next) {
+        // Reset path state but keep scored cells so territory persists across runs
+        const st = stateRef.current;
+        st.path = [];
+        st.pathIndex = {};
+        st.lastLng = null;
+        st.lastLat = null;
+        if (mapReady.current && mapRef.current) {
+          mapRef.current.getSource("path").setData({ type: "FeatureCollection", features: [] });
+        }
+        setInfo("Run started — walk around to capture territory · close a loop to score!");
+      } else {
+        setInfo(`Run stopped · ${stateRef.current.circuitCount} circuit(s) completed · ${Object.keys(stateRef.current.scoredCells).length} cells captured`);
+      }
+      return next;
+    });
+  }, []);
+
+  // Map init
   useEffect(() => {
     if (!libsLoaded || !mapContainerRef.current || mapRef.current) return;
 
@@ -374,55 +336,54 @@ export default function App() {
         map.addLayer({ id: "flash-fill",    type: "fill", source: "flash",  paint: { "fill-color": "rgba(255,255,120,0.6)", "fill-opacity": 1 } });
         mapReady.current = true;
         updateStats();
-      });
 
-      const canvas = map.getCanvas();
-
-      // ── getH3WithCoords: returns { cell, lng, lat } for a pointer/touch event ──
-      // We extract BOTH the H3 cell AND the raw map coordinates from every event
-      // so addCell can do geographic interpolation between consecutive pings.
-      const getH3WithCoords = (e) => {
-        const rect = canvas.getBoundingClientRect();
-        const pt = e.touches ? e.touches[0] : e;
-        const { lng, lat } = map.unproject([pt.clientX - rect.left, pt.clientY - rect.top]);
-        try {
-          const cell = window.h3.latLngToCell(lat, lng, stateRef.current.res);
-          return { cell, lng, lat };
-        } catch {
-          return { cell: null, lng, lat };
+        // ── GPS Marker (pulsing dot) ──────────────────────────────────────
+        const el = document.createElement("div");
+        el.style.cssText = `
+          width: 20px; height: 20px; border-radius: 50%;
+          background: rgba(56,189,248,0.9);
+          border: 2.5px solid #fff;
+          box-shadow: 0 0 0 0 rgba(56,189,248,0.6);
+          animation: gpsPulse 2s infinite;
+          position: relative; cursor: default;
+        `;
+        // inject keyframes once
+        if (!document.getElementById("gpsPulseStyle")) {
+          const style = document.createElement("style");
+          style.id = "gpsPulseStyle";
+          style.textContent = `
+            @keyframes gpsPulse {
+              0%   { box-shadow: 0 0 0 0   rgba(56,189,248,0.55); }
+              70%  { box-shadow: 0 0 0 14px rgba(56,189,248,0);   }
+              100% { box-shadow: 0 0 0 0   rgba(56,189,248,0);    }
+            }
+            @keyframes gpsPulseRun {
+              0%   { box-shadow: 0 0 0 0   rgba(74,222,128,0.7);  }
+              70%  { box-shadow: 0 0 0 18px rgba(74,222,128,0);   }
+              100% { box-shadow: 0 0 0 0   rgba(74,222,128,0);    }
+            }
+          `;
+          document.head.appendChild(style);
         }
-      };
 
-      canvas.addEventListener("mousedown",  (e) => {
-        isDrawing.current = true;
-        map.dragPan.disable();
-        const { cell, lng, lat } = getH3WithCoords(e);
-        if (cell) addCell(cell, lng, lat);
+        const marker = new window.mapboxgl.Marker({ element: el, anchor: "center" })
+          .setLngLat(center)
+          .addTo(map);
+        markerRef.current = marker;
+        markerRef.current._el = el; // keep ref to change style on run toggle
       });
-      canvas.addEventListener("mousemove",  (e) => {
-        const { cell, lng, lat } = getH3WithCoords(e);
-        setHoveredCell(cell);
-        if (isDrawing.current && cell) addCell(cell, lng, lat);
-      });
-      canvas.addEventListener("mouseup",    ()  => { isDrawing.current = false; map.dragPan.enable(); });
-      canvas.addEventListener("mouseleave", ()  => { isDrawing.current = false; map.dragPan.enable(); setHoveredCell(null); });
-      canvas.addEventListener("touchstart", (e) => {
-        e.preventDefault();
-        isDrawing.current = true;
-        map.dragPan.disable();
-        const { cell, lng, lat } = getH3WithCoords(e);
-        if (cell) addCell(cell, lng, lat);
-      }, { passive: false });
-      canvas.addEventListener("touchmove",  (e) => {
-        e.preventDefault();
-        if (!isDrawing.current) return;
-        const { cell, lng, lat } = getH3WithCoords(e);
-        if (cell) addCell(cell, lng, lat);
-      }, { passive: false });
-      canvas.addEventListener("touchend",   ()  => { isDrawing.current = false; map.dragPan.enable(); });
     };
 
+    // Start continuous GPS watch from the start
     if ("geolocation" in navigator) {
+      const id = navigator.geolocation.watchPosition(
+        handleGPSPosition,
+        handleGPSError,
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+      );
+      watchIdRef.current = id;
+
+      // Initial center — grab a quick one-shot first then watch takes over
       navigator.geolocation.getCurrentPosition(
         (pos) => initializeMap([pos.coords.longitude, pos.coords.latitude]),
         ()    => initializeMap([72.8777, 19.076]),
@@ -433,46 +394,102 @@ export default function App() {
     }
 
     return () => {
+      if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
       if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; mapReady.current = false; }
     };
-  }, [libsLoaded, addCell, updateStats]);
+  }, [libsLoaded, handleGPSPosition, handleGPSError, updateStats]);
+
+  // Update GPS marker color when run state changes
+  useEffect(() => {
+    if (!markerRef.current?._el) return;
+    const el = markerRef.current._el;
+    if (isRunning) {
+      el.style.background = "rgba(74,222,128,0.95)";
+      el.style.animation = "gpsPulseRun 1.4s infinite";
+    } else {
+      el.style.background = "rgba(56,189,248,0.9)";
+      el.style.animation = "gpsPulse 2s infinite";
+    }
+  }, [isRunning]);
 
   const handleResChange = useCallback((newRes) => {
     setRes(newRes);
     stateRef.current.res = newRes;
     if (mapRef.current) mapRef.current.flyTo({ zoom: newRes === 11 ? 15.5 : 17, duration: 700 });
     resetAll();
-    setInfo(`Switched to Res ${newRes} (~${newRes === 11 ? "25m" : "9m"} cells) · Draw your path on the map`);
+    setInfo(`Switched to Res ${newRes} (~${newRes === 11 ? "25m" : "9m"} cells) · Press Start Run to capture`);
   }, [resetAll]);
+
+  // Re-center map on user
+  const reCenterOnUser = useCallback(() => {
+    if (!mapRef.current || !markerRef.current) return;
+    const lngLat = markerRef.current.getLngLat();
+    mapRef.current.flyTo({ center: [lngLat.lng, lngLat.lat], zoom: 17, duration: 800 });
+  }, []);
 
   return (
     <div style={{ fontFamily: "'DM Mono','Courier New',monospace", display: "flex", flexDirection: "column", height: "100vh", background: "#0a0e14", color: "#e2eaf5" }}>
+      {/* ── Header ── */}
       <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "9px 16px", background: "#0f1520", borderBottom: "1px solid rgba(99,140,200,0.18)", flexShrink: 0, flexWrap: "wrap" }}>
         <span style={{ fontSize: 12, letterSpacing: 2, textTransform: "uppercase", color: "#22d3ee", fontWeight: 700, whiteSpace: "nowrap" }}>
           H3 · Territory
         </span>
         <div style={{ width: 1, height: 22, background: "rgba(99,140,200,0.18)", flexShrink: 0 }} />
+
+        {/* Res selector */}
         <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
           <span style={{ fontSize: 10, color: "#6b82a0", letterSpacing: 1, textTransform: "uppercase" }}>Res</span>
           {[11, 12].map((r) => (
-            <button key={r} onClick={() => handleResChange(r)} style={{ fontSize: 11, padding: "4px 12px", borderRadius: 5, border: res === r ? "1.5px solid #3b82f6" : "1px solid rgba(99,140,200,0.25)", background: res === r ? "#3b82f6" : "transparent", color: res === r ? "#fff" : "#6b82a0", cursor: "pointer", fontFamily: "inherit", fontWeight: res === r ? 700 : 400, transition: "all 0.15s" }}>
+            <button key={r} onClick={() => handleResChange(r)} disabled={isRunning} style={{ fontSize: 11, padding: "4px 12px", borderRadius: 5, border: res === r ? "1.5px solid #3b82f6" : "1px solid rgba(99,140,200,0.25)", background: res === r ? "#3b82f6" : "transparent", color: res === r ? "#fff" : "#6b82a0", cursor: isRunning ? "not-allowed" : "pointer", fontFamily: "inherit", fontWeight: res === r ? 700 : 400, opacity: isRunning ? 0.5 : 1, transition: "all 0.15s" }}>
               {r} <span style={{ opacity: 0.6, fontWeight: 400 }}>~{r === 11 ? "25m" : "9m"}</span>
             </button>
           ))}
         </div>
+
         <div style={{ width: 1, height: 22, background: "rgba(99,140,200,0.18)", flexShrink: 0 }} />
+
+        {/* Stats */}
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           {[["Path", stats.path], ["Circuits", stats.circuits], ["Captured", stats.captured], ["Max score", stats.maxScore]].map(([label, val]) => (
             <div key={label} style={{ background: "#141c2b", border: "1px solid rgba(99,140,200,0.18)", borderRadius: 6, padding: "4px 10px", fontSize: 11, color: "#6b82a0", whiteSpace: "nowrap" }}>
               {label}: <strong style={{ color: "#e2eaf5" }}>{val}</strong>
             </div>
           ))}
+          {/* GPS accuracy pill */}
+          <div style={{ background: "#141c2b", border: `1px solid ${gpsReady ? "rgba(74,222,128,0.35)" : "rgba(251,191,36,0.35)"}`, borderRadius: 6, padding: "4px 10px", fontSize: 11, color: gpsReady ? "#4ade80" : "#fbbf24", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ width: 6, height: 6, borderRadius: "50%", background: gpsReady ? "#4ade80" : "#fbbf24", display: "inline-block", flexShrink: 0 }} />
+            {gpsReady ? `GPS ±${gpsAccuracy}m` : "GPS…"}
+          </div>
         </div>
-        <button onClick={resetAll} style={{ marginLeft: "auto", fontSize: 11, padding: "5px 14px", borderRadius: 6, border: "1px solid rgba(239,68,68,0.4)", background: "rgba(239,68,68,0.08)", color: "#f87171", cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>
+
+        {/* Start / Stop Run button */}
+        <button
+          onClick={toggleRun}
+          disabled={!gpsReady}
+          style={{
+            fontSize: 12, padding: "6px 18px", borderRadius: 7, fontFamily: "inherit", fontWeight: 700, cursor: gpsReady ? "pointer" : "not-allowed", transition: "all 0.2s", whiteSpace: "nowrap", letterSpacing: 0.5,
+            border: isRunning ? "1.5px solid rgba(248,113,113,0.6)" : "1.5px solid rgba(74,222,128,0.55)",
+            background: isRunning ? "rgba(239,68,68,0.15)" : "rgba(74,222,128,0.12)",
+            color: isRunning ? "#f87171" : "#4ade80",
+            boxShadow: isRunning ? "0 0 12px rgba(239,68,68,0.2)" : "0 0 12px rgba(74,222,128,0.15)",
+            opacity: gpsReady ? 1 : 0.45,
+          }}
+        >
+          {isRunning ? "⏹ Stop Run" : "▶ Start Run"}
+        </button>
+
+        {/* Re-center button */}
+        <button onClick={reCenterOnUser} disabled={!gpsReady} title="Re-center on my location" style={{ fontSize: 13, padding: "5px 10px", borderRadius: 6, border: "1px solid rgba(99,140,200,0.25)", background: "transparent", color: "#6b82a0", cursor: gpsReady ? "pointer" : "not-allowed", fontFamily: "inherit", opacity: gpsReady ? 1 : 0.4 }}>
+          ◎
+        </button>
+
+        {/* Reset */}
+        <button onClick={resetAll} disabled={isRunning} style={{ fontSize: 11, padding: "5px 14px", borderRadius: 6, border: "1px solid rgba(239,68,68,0.4)", background: "rgba(239,68,68,0.08)", color: isRunning ? "#6b82a0" : "#f87171", cursor: isRunning ? "not-allowed" : "pointer", fontFamily: "inherit", whiteSpace: "nowrap", opacity: isRunning ? 0.45 : 1 }}>
           ↺ Reset
         </button>
       </div>
 
+      {/* ── Map ── */}
       <div style={{ position: "relative", flex: 1 }}>
         {!libsLoaded && (
           <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#6b82a0", fontSize: 13, zIndex: 10 }}>
@@ -481,16 +498,20 @@ export default function App() {
         )}
         <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }} />
 
-        {hoveredCell && (
-          <div style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", background: "rgba(10,14,20,0.92)", border: "1px solid rgba(34,211,238,0.4)", backdropFilter: "blur(8px)", borderRadius: 8, padding: "5px 14px", fontSize: 11, color: "#22d3ee", pointerEvents: "none", zIndex: 25, whiteSpace: "nowrap" }}>
-            H3 res-{res}: <strong>{hoveredCell}</strong>
+        {/* Running indicator banner */}
+        {isRunning && (
+          <div style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", background: "rgba(10,14,20,0.92)", border: "1px solid rgba(74,222,128,0.5)", backdropFilter: "blur(8px)", borderRadius: 8, padding: "5px 16px", fontSize: 11, color: "#4ade80", pointerEvents: "none", zIndex: 25, whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#4ade80", display: "inline-block", animation: "gpsPulseRun 1.4s infinite" }} />
+            Tracking · walk to capture territory
           </div>
         )}
 
+        {/* Info bar */}
         <div style={{ position: "absolute", bottom: 28, left: "50%", transform: "translateX(-50%)", background: "rgba(10,14,20,0.88)", border: "1px solid rgba(99,140,200,0.2)", backdropFilter: "blur(10px)", borderRadius: 10, padding: "8px 18px", fontSize: 11, color: "#22d3ee", pointerEvents: "none", zIndex: 20, maxWidth: "90vw", textAlign: "center" }}>
           {info}
         </div>
 
+        {/* Legend */}
         <div style={{ position: "absolute", bottom: 74, right: 14, background: "rgba(10,14,20,0.88)", border: "1px solid rgba(99,140,200,0.2)", backdropFilter: "blur(10px)", borderRadius: 10, padding: "10px 14px", zIndex: 20, fontSize: 10, color: "#6b82a0" }}>
           {[["rgba(239,68,68,0.55)", "#ef4444", "Path start"], ["rgba(59,130,246,0.32)", "#3b82f6", "Active path"], ["rgba(251,191,36,0.7)", "#f59e0b", "Current cell"]].map(([bg, border, label]) => (
             <div key={label} style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
@@ -498,6 +519,11 @@ export default function App() {
               {label}
             </div>
           ))}
+          {/* GPS marker legend row */}
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
+            <div style={{ width: 13, height: 13, borderRadius: "50%", background: isRunning ? "rgba(74,222,128,0.9)" : "rgba(56,189,248,0.9)", border: "2px solid #fff", flexShrink: 0 }} />
+            {isRunning ? "You (running)" : "You (idle)"}
+          </div>
           <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 4 }}>
             {SCORE_COLORS.map((s) => (
               <div key={s} style={{ width: 13, height: 13, borderRadius: 3, background: scoreToFill(s), border: `1px solid ${scoreToStroke(s)}` }} title={`Score ${s}`} />
