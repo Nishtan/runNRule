@@ -21,8 +21,12 @@ function loadLink(href) {
 const MAPBOX_TOKEN =
   "pk.eyJ1IjoibmlzaHRhbiIsImEiOiJja3ZkcGNmZWg0d25wMm5xd2RkcDBzeHVsIn0.irJll1qHLs4XBFONtsVYFA";
 
+const FIXED_RES = 13;
+
+// Score is cumulative √A (m²). Res-13 hex ≈ 600m².
+// 50-cell circuit ≈ 30,000m², √A ≈ 173. Normalize color at ~300.
 function scoreToFill(score) {
-  const t = Math.min(score / 6, 1);
+  const t = Math.min(score / 300, 1);
   const r = Math.round(110 + (5 - 110) * t);
   const g = Math.round(231 + (150 - 231) * t);
   const b = Math.round(183 + (105 - 183) * t);
@@ -30,7 +34,7 @@ function scoreToFill(score) {
 }
 
 function scoreToStroke(score) {
-  const t = Math.min(score / 6, 1);
+  const t = Math.min(score / 300, 1);
   const g = Math.round(185 - 120 * t);
   return `rgba(16,${g},82,${0.7 + 0.3 * t})`;
 }
@@ -44,7 +48,7 @@ function cellBoundaryToGeoJSON(h3index) {
 
 const MAX_GAP_CELLS = 40;
 
-function bridgeTo(fromCell, toCell, fromLng, fromLat, toLng, toLat, res) {
+function bridgeTo(fromCell, toCell, fromLng, fromLat, toLng, toLat) {
   if (fromCell === toCell) return [];
   const h3 = window.h3;
   let gridDist = MAX_GAP_CELLS;
@@ -58,7 +62,7 @@ function bridgeTo(fromCell, toCell, fromLng, fromLat, toLng, toLat, res) {
     const lat = fromLat + (toLat - fromLat) * t;
     const lng = fromLng + (toLng - fromLng) * t;
     let cell;
-    try { cell = h3.latLngToCell(lat, lng, res); } catch { continue; }
+    try { cell = h3.latLngToCell(lat, lng, FIXED_RES); } catch { continue; }
     if (cell !== prevCell) { cells.push(cell); prevCell = cell; }
   }
   return cells;
@@ -123,31 +127,31 @@ function buildPathFeatures(path) {
   });
 }
 
-const SCORE_COLORS = [1, 2, 3, 4, 5, 6];
+const SCORE_STEPS = [20, 60, 100, 150, 200, 300];
 
 export default function App() {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
-  const markerRef = useRef(null);          // Mapbox Marker for GPS dot
-  const watchIdRef = useRef(null);         // geolocation watchPosition id
+  const markerRef = useRef(null);
+  const watchIdRef = useRef(null);
   const stateRef = useRef({
     path: [],
     pathIndex: {},
     scoredCells: {},
     circuitCount: 0,
-    res: 12,
+    totalScore: 0,
+    lastCircuitScore: null,
     lastLng: null,
     lastLat: null,
   });
   const mapReady = useRef(false);
-  const isRunningRef = useRef(false);      // mirrors isRunning state, avoids stale closure in GPS cb
+  const isRunningRef = useRef(false);
 
-  const [res, setRes] = useState(12);
-  const [stats, setStats] = useState({ path: 0, circuits: 0, captured: 0, maxScore: 0 });
+  const [stats, setStats] = useState({ path: 0, circuits: 0, captured: 0, totalScore: 0, lastCircuitScore: null });
   const [info, setInfo] = useState("Allow location access — your position will appear on the map");
   const [libsLoaded, setLibsLoaded] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
-  const [gpsReady, setGpsReady] = useState(false);   // true once we have ≥1 GPS fix
+  const [gpsReady, setGpsReady] = useState(false);
   const [gpsAccuracy, setGpsAccuracy] = useState(null);
 
   useEffect(() => {
@@ -159,13 +163,13 @@ export default function App() {
   }, []);
 
   const updateStats = useCallback(() => {
-    const { path, scoredCells, circuitCount } = stateRef.current;
-    const scores = Object.values(scoredCells);
+    const { path, scoredCells, circuitCount, totalScore, lastCircuitScore } = stateRef.current;
     setStats({
       path: path.length,
       circuits: circuitCount,
       captured: Object.keys(scoredCells).length,
-      maxScore: scores.length ? Math.max(...scores) : 0,
+      totalScore: Math.round(totalScore * 10) / 10,
+      lastCircuitScore: lastCircuitScore != null ? Math.round(lastCircuitScore * 10) / 10 : null,
     });
   }, []);
 
@@ -193,13 +197,29 @@ export default function App() {
     const loop = st.path.slice(loopStartIdx);
     const ringSet = new Set(loop);
     const interior = floodFillInterior(ringSet);
-    interior.forEach((id) => { st.scoredCells[id] = (st.scoredCells[id] || 0) + 1; });
-    loop.forEach((id)     => { st.scoredCells[id] = (st.scoredCells[id] || 0) + 1; });
+
+    // A = sum of actual geographic area (m²) of all hexagons in this circuit
+    const allCells = [...interior, ...loop];
+    const A = allCells.reduce((sum, id) => {
+      try { return sum + window.h3.cellArea(id, "m2"); }
+      catch { return sum; }
+    }, 0);
+    const circuitScore = Math.sqrt(A);
+
+    interior.forEach((id) => { st.scoredCells[id] = (st.scoredCells[id] || 0) + circuitScore; });
+    loop.forEach((id)     => { st.scoredCells[id] = (st.scoredCells[id] || 0) + circuitScore; });
+
     st.circuitCount++;
+    st.totalScore = (st.totalScore || 0) + circuitScore;
+    st.lastCircuitScore = circuitScore;
+
     st.path = [closingCell];
     st.pathIndex = { [closingCell]: 0 };
+
     flashInterior(interior);
-    setInfo(`Circuit #${st.circuitCount} closed! ${interior.length} interior cells captured · reseeded ✓`);
+    setInfo(
+      `Circuit #${st.circuitCount} · A=${Math.round(A).toLocaleString()}m² · +√A = +${circuitScore.toFixed(1)} · total ${st.totalScore.toFixed(1)}`
+    );
     redraw();
   }, [flashInterior, redraw]);
 
@@ -218,7 +238,7 @@ export default function App() {
     if (tail === rawCell) { st.lastLng = lng; st.lastLat = lat; return; }
     const fromLng = st.lastLng ?? lng;
     const fromLat = st.lastLat ?? lat;
-    const bridge = bridgeTo(tail, rawCell, fromLng, fromLat, lng, lat, st.res);
+    const bridge = bridgeTo(tail, rawCell, fromLng, fromLat, lng, lat);
     st.lastLng = lng;
     st.lastLat = lat;
     for (const cell of bridge) {
@@ -239,7 +259,8 @@ export default function App() {
       pathIndex: {},
       scoredCells: {},
       circuitCount: 0,
-      res: stateRef.current.res,
+      totalScore: 0,
+      lastCircuitScore: null,
       lastLng: null,
       lastLat: null,
     };
@@ -252,28 +273,22 @@ export default function App() {
     setInfo("Press Start Run to begin capturing territory with your GPS");
   }, [updateStats]);
 
-  // ── GPS callback — always update marker; only capture area when running ───
   const handleGPSPosition = useCallback((pos) => {
     const { longitude: lng, latitude: lat, accuracy } = pos.coords;
     setGpsAccuracy(Math.round(accuracy));
     setGpsReady(true);
 
-    // Move the marker
-    if (markerRef.current) {
-      markerRef.current.setLngLat([lng, lat]);
-    }
+    if (markerRef.current) markerRef.current.setLngLat([lng, lat]);
 
-    // Center map on first fix only (or if very first load)
     if (mapRef.current && !mapRef.current._hasCenteredOnUser) {
-      mapRef.current.flyTo({ center: [lng, lat], zoom: 17, duration: 1200 });
+      mapRef.current.flyTo({ center: [lng, lat], zoom: 18, duration: 1200 });
       mapRef.current._hasCenteredOnUser = true;
     }
 
-    // Area capture only while running
     if (!isRunningRef.current) return;
 
     const cell = (() => {
-      try { return window.h3.latLngToCell(lat, lng, stateRef.current.res); }
+      try { return window.h3.latLngToCell(lat, lng, FIXED_RES); }
       catch { return null; }
     })();
     if (cell) addCell(cell, lng, lat);
@@ -284,13 +299,11 @@ export default function App() {
     setInfo("GPS error: " + err.message);
   }, []);
 
-  // Start / stop run
   const toggleRun = useCallback(() => {
     setIsRunning((prev) => {
       const next = !prev;
       isRunningRef.current = next;
       if (next) {
-        // Reset path state but keep scored cells so territory persists across runs
         const st = stateRef.current;
         st.path = [];
         st.pathIndex = {};
@@ -301,13 +314,13 @@ export default function App() {
         }
         setInfo("Run started — walk around to capture territory · close a loop to score!");
       } else {
-        setInfo(`Run stopped · ${stateRef.current.circuitCount} circuit(s) completed · ${Object.keys(stateRef.current.scoredCells).length} cells captured`);
+        const st = stateRef.current;
+        setInfo(`Run stopped · ${st.circuitCount} circuit(s) · ${Object.keys(st.scoredCells).length} cells · total score ${(st.totalScore || 0).toFixed(1)}`);
       }
       return next;
     });
   }, []);
 
-  // Map init
   useEffect(() => {
     if (!libsLoaded || !mapContainerRef.current || mapRef.current) return;
 
@@ -317,8 +330,8 @@ export default function App() {
         container: mapContainerRef.current,
         style: "mapbox://styles/mapbox/dark-v11",
         center,
-        zoom: 17,
-        minZoom: 13,
+        zoom: 18,
+        minZoom: 14,
         maxZoom: 21,
         antialias: true,
       });
@@ -337,17 +350,15 @@ export default function App() {
         mapReady.current = true;
         updateStats();
 
-        // ── GPS Marker (pulsing dot) ──────────────────────────────────────
         const el = document.createElement("div");
         el.style.cssText = `
-          width: 20px; height: 20px; border-radius: 50%;
+          width: 18px; height: 18px; border-radius: 50%;
           background: rgba(56,189,248,0.9);
           border: 2.5px solid #fff;
           box-shadow: 0 0 0 0 rgba(56,189,248,0.6);
           animation: gpsPulse 2s infinite;
           position: relative; cursor: default;
         `;
-        // inject keyframes once
         if (!document.getElementById("gpsPulseStyle")) {
           const style = document.createElement("style");
           style.id = "gpsPulseStyle";
@@ -370,11 +381,10 @@ export default function App() {
           .setLngLat(center)
           .addTo(map);
         markerRef.current = marker;
-        markerRef.current._el = el; // keep ref to change style on run toggle
+        markerRef.current._el = el;
       });
     };
 
-    // Start continuous GPS watch from the start
     if ("geolocation" in navigator) {
       const id = navigator.geolocation.watchPosition(
         handleGPSPosition,
@@ -383,7 +393,6 @@ export default function App() {
       );
       watchIdRef.current = id;
 
-      // Initial center — grab a quick one-shot first then watch takes over
       navigator.geolocation.getCurrentPosition(
         (pos) => initializeMap([pos.coords.longitude, pos.coords.latitude]),
         ()    => initializeMap([72.8777, 19.076]),
@@ -399,7 +408,6 @@ export default function App() {
     };
   }, [libsLoaded, handleGPSPosition, handleGPSError, updateStats]);
 
-  // Update GPS marker color when run state changes
   useEffect(() => {
     if (!markerRef.current?._el) return;
     const el = markerRef.current._el;
@@ -412,19 +420,10 @@ export default function App() {
     }
   }, [isRunning]);
 
-  const handleResChange = useCallback((newRes) => {
-    setRes(newRes);
-    stateRef.current.res = newRes;
-    if (mapRef.current) mapRef.current.flyTo({ zoom: newRes === 11 ? 15.5 : 17, duration: 700 });
-    resetAll();
-    setInfo(`Switched to Res ${newRes} (~${newRes === 11 ? "25m" : "9m"} cells) · Press Start Run to capture`);
-  }, [resetAll]);
-
-  // Re-center map on user
   const reCenterOnUser = useCallback(() => {
     if (!mapRef.current || !markerRef.current) return;
     const lngLat = markerRef.current.getLngLat();
-    mapRef.current.flyTo({ center: [lngLat.lng, lngLat.lat], zoom: 17, duration: 800 });
+    mapRef.current.flyTo({ center: [lngLat.lng, lngLat.lat], zoom: 18, duration: 800 });
   }, []);
 
   return (
@@ -434,56 +433,40 @@ export default function App() {
         <span style={{ fontSize: 12, letterSpacing: 2, textTransform: "uppercase", color: "#22d3ee", fontWeight: 700, whiteSpace: "nowrap" }}>
           H3 · Territory
         </span>
-        <div style={{ width: 1, height: 22, background: "rgba(99,140,200,0.18)", flexShrink: 0 }} />
-
-        {/* Res selector */}
-        <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-          <span style={{ fontSize: 10, color: "#6b82a0", letterSpacing: 1, textTransform: "uppercase" }}>Res</span>
-          {[11, 12].map((r) => (
-            <button key={r} onClick={() => handleResChange(r)} disabled={isRunning} style={{ fontSize: 11, padding: "4px 12px", borderRadius: 5, border: res === r ? "1.5px solid #3b82f6" : "1px solid rgba(99,140,200,0.25)", background: res === r ? "#3b82f6" : "transparent", color: res === r ? "#fff" : "#6b82a0", cursor: isRunning ? "not-allowed" : "pointer", fontFamily: "inherit", fontWeight: res === r ? 700 : 400, opacity: isRunning ? 0.5 : 1, transition: "all 0.15s" }}>
-              {r} <span style={{ opacity: 0.6, fontWeight: 400 }}>~{r === 11 ? "25m" : "9m"}</span>
-            </button>
-          ))}
-        </div>
+        <span style={{ fontSize: 10, color: "#3b5a80", letterSpacing: 1, whiteSpace: "nowrap" }}>
+          RES 13 · ~3m cells
+        </span>
 
         <div style={{ width: 1, height: 22, background: "rgba(99,140,200,0.18)", flexShrink: 0 }} />
 
         {/* Stats */}
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {[["Path", stats.path], ["Circuits", stats.circuits], ["Captured", stats.captured], ["Max score", stats.maxScore]].map(([label, val]) => (
+          {[["Path", stats.path], ["Circuits", stats.circuits], ["Captured", stats.captured], ["Score", stats.totalScore]].map(([label, val]) => (
             <div key={label} style={{ background: "#141c2b", border: "1px solid rgba(99,140,200,0.18)", borderRadius: 6, padding: "4px 10px", fontSize: 11, color: "#6b82a0", whiteSpace: "nowrap" }}>
-              {label}: <strong style={{ color: "#e2eaf5" }}>{val}</strong>
+              {label}: <strong style={{ color: label === "Score" ? "#fbbf24" : "#e2eaf5" }}>{val}</strong>
             </div>
           ))}
-          {/* GPS accuracy pill */}
+
+          {stats.lastCircuitScore != null && (
+            <div style={{ background: "#141c2b", border: "1px solid rgba(251,191,36,0.35)", borderRadius: 6, padding: "4px 10px", fontSize: 11, color: "#fbbf24", whiteSpace: "nowrap" }}>
+              Last +√A: <strong>+{stats.lastCircuitScore}</strong>
+            </div>
+          )}
+
           <div style={{ background: "#141c2b", border: `1px solid ${gpsReady ? "rgba(74,222,128,0.35)" : "rgba(251,191,36,0.35)"}`, borderRadius: 6, padding: "4px 10px", fontSize: 11, color: gpsReady ? "#4ade80" : "#fbbf24", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5 }}>
             <span style={{ width: 6, height: 6, borderRadius: "50%", background: gpsReady ? "#4ade80" : "#fbbf24", display: "inline-block", flexShrink: 0 }} />
             {gpsReady ? `GPS ±${gpsAccuracy}m` : "GPS…"}
           </div>
         </div>
 
-        {/* Start / Stop Run button */}
-        <button
-          onClick={toggleRun}
-          disabled={!gpsReady}
-          style={{
-            fontSize: 12, padding: "6px 18px", borderRadius: 7, fontFamily: "inherit", fontWeight: 700, cursor: gpsReady ? "pointer" : "not-allowed", transition: "all 0.2s", whiteSpace: "nowrap", letterSpacing: 0.5,
-            border: isRunning ? "1.5px solid rgba(248,113,113,0.6)" : "1.5px solid rgba(74,222,128,0.55)",
-            background: isRunning ? "rgba(239,68,68,0.15)" : "rgba(74,222,128,0.12)",
-            color: isRunning ? "#f87171" : "#4ade80",
-            boxShadow: isRunning ? "0 0 12px rgba(239,68,68,0.2)" : "0 0 12px rgba(74,222,128,0.15)",
-            opacity: gpsReady ? 1 : 0.45,
-          }}
-        >
+        <button onClick={toggleRun} disabled={!gpsReady} style={{ fontSize: 12, padding: "6px 18px", borderRadius: 7, fontFamily: "inherit", fontWeight: 700, cursor: gpsReady ? "pointer" : "not-allowed", transition: "all 0.2s", whiteSpace: "nowrap", letterSpacing: 0.5, border: isRunning ? "1.5px solid rgba(248,113,113,0.6)" : "1.5px solid rgba(74,222,128,0.55)", background: isRunning ? "rgba(239,68,68,0.15)" : "rgba(74,222,128,0.12)", color: isRunning ? "#f87171" : "#4ade80", boxShadow: isRunning ? "0 0 12px rgba(239,68,68,0.2)" : "0 0 12px rgba(74,222,128,0.15)", opacity: gpsReady ? 1 : 0.45 }}>
           {isRunning ? "⏹ Stop Run" : "▶ Start Run"}
         </button>
 
-        {/* Re-center button */}
         <button onClick={reCenterOnUser} disabled={!gpsReady} title="Re-center on my location" style={{ fontSize: 13, padding: "5px 10px", borderRadius: 6, border: "1px solid rgba(99,140,200,0.25)", background: "transparent", color: "#6b82a0", cursor: gpsReady ? "pointer" : "not-allowed", fontFamily: "inherit", opacity: gpsReady ? 1 : 0.4 }}>
           ◎
         </button>
 
-        {/* Reset */}
         <button onClick={resetAll} disabled={isRunning} style={{ fontSize: 11, padding: "5px 14px", borderRadius: 6, border: "1px solid rgba(239,68,68,0.4)", background: "rgba(239,68,68,0.08)", color: isRunning ? "#6b82a0" : "#f87171", cursor: isRunning ? "not-allowed" : "pointer", fontFamily: "inherit", whiteSpace: "nowrap", opacity: isRunning ? 0.45 : 1 }}>
           ↺ Reset
         </button>
@@ -498,7 +481,6 @@ export default function App() {
         )}
         <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }} />
 
-        {/* Running indicator banner */}
         {isRunning && (
           <div style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", background: "rgba(10,14,20,0.92)", border: "1px solid rgba(74,222,128,0.5)", backdropFilter: "blur(8px)", borderRadius: 8, padding: "5px 16px", fontSize: 11, color: "#4ade80", pointerEvents: "none", zIndex: 25, whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#4ade80", display: "inline-block", animation: "gpsPulseRun 1.4s infinite" }} />
@@ -506,12 +488,10 @@ export default function App() {
           </div>
         )}
 
-        {/* Info bar */}
         <div style={{ position: "absolute", bottom: 28, left: "50%", transform: "translateX(-50%)", background: "rgba(10,14,20,0.88)", border: "1px solid rgba(99,140,200,0.2)", backdropFilter: "blur(10px)", borderRadius: 10, padding: "8px 18px", fontSize: 11, color: "#22d3ee", pointerEvents: "none", zIndex: 20, maxWidth: "90vw", textAlign: "center" }}>
           {info}
         </div>
 
-        {/* Legend */}
         <div style={{ position: "absolute", bottom: 74, right: 14, background: "rgba(10,14,20,0.88)", border: "1px solid rgba(99,140,200,0.2)", backdropFilter: "blur(10px)", borderRadius: 10, padding: "10px 14px", zIndex: 20, fontSize: 10, color: "#6b82a0" }}>
           {[["rgba(239,68,68,0.55)", "#ef4444", "Path start"], ["rgba(59,130,246,0.32)", "#3b82f6", "Active path"], ["rgba(251,191,36,0.7)", "#f59e0b", "Current cell"]].map(([bg, border, label]) => (
             <div key={label} style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
@@ -519,16 +499,19 @@ export default function App() {
               {label}
             </div>
           ))}
-          {/* GPS marker legend row */}
           <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
             <div style={{ width: 13, height: 13, borderRadius: "50%", background: isRunning ? "rgba(74,222,128,0.9)" : "rgba(56,189,248,0.9)", border: "2px solid #fff", flexShrink: 0 }} />
             {isRunning ? "You (running)" : "You (idle)"}
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 4 }}>
-            {SCORE_COLORS.map((s) => (
+            {SCORE_STEPS.map((s) => (
               <div key={s} style={{ width: 13, height: 13, borderRadius: 3, background: scoreToFill(s), border: `1px solid ${scoreToStroke(s)}` }} title={`Score ${s}`} />
             ))}
-            <span style={{ marginLeft: 4 }}>score ×1→6</span>
+            <span style={{ marginLeft: 4 }}>score (√A)</span>
+          </div>
+          <div style={{ marginTop: 6, fontSize: 9, color: "#3b5a80", lineHeight: 1.6 }}>
+            Per circuit: +√A pts<br />
+            A = Σ cellArea(hex) in m²
           </div>
         </div>
       </div>
