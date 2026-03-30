@@ -21,10 +21,12 @@ function loadLink(href) {
 const MAPBOX_TOKEN =
   "pk.eyJ1IjoibmlzaHRhbiIsImEiOiJja3ZkcGNmZWg0d25wMm5xd2RkcDBzeHVsIn0.irJll1qHLs4XBFONtsVYFA";
 
-const FIXED_RES = 13;
+const FIXED_RES = 12;
 
-// Score is cumulative √A (m²). Res-13 hex ≈ 600m².
-// 50-cell circuit ≈ 30,000m², √A ≈ 173. Normalize color at ~300.
+// How many recent cells to treat as "jitter zone" — revisiting within this
+// window trims the path back instead of closing a circuit.
+const BACKTRACK_TOLERANCE = 5;
+
 function scoreToFill(score) {
   const t = Math.min(score / 300, 1);
   const r = Math.round(110 + (5 - 110) * t);
@@ -198,7 +200,6 @@ export default function App() {
     const ringSet = new Set(loop);
     const interior = floodFillInterior(ringSet);
 
-    // A = sum of actual geographic area (m²) of all hexagons in this circuit
     const allCells = [...interior, ...loop];
     const A = allCells.reduce((sum, id) => {
       try { return sum + window.h3.cellArea(id, "m2"); }
@@ -226,6 +227,7 @@ export default function App() {
   const addCell = useCallback((rawCell, lng, lat) => {
     if (!rawCell) return;
     const st = stateRef.current;
+
     if (st.path.length === 0) {
       st.path.push(rawCell);
       st.pathIndex[rawCell] = 0;
@@ -234,22 +236,45 @@ export default function App() {
       redraw();
       return;
     }
+
     const tail = st.path[st.path.length - 1];
     if (tail === rawCell) { st.lastLng = lng; st.lastLat = lat; return; }
+
     const fromLng = st.lastLng ?? lng;
     const fromLat = st.lastLat ?? lat;
     const bridge = bridgeTo(tail, rawCell, fromLng, fromLat, lng, lat);
     st.lastLng = lng;
     st.lastLat = lat;
+
     for (const cell of bridge) {
-      if (st.pathIndex[cell] !== undefined) {
-        st.path.push(cell);
-        closeCircuit(st.pathIndex[cell], cell);
-        return;
+      const existingIdx = st.pathIndex[cell];
+
+      if (existingIdx !== undefined) {
+        const pathLen = st.path.length;
+        const windowStart = Math.max(0, pathLen - BACKTRACK_TOLERANCE);
+
+        if (existingIdx >= windowStart) {
+          // ── Jitter zone: trim path back to this cell, rebuild pathIndex ──
+          // Remove all cells after existingIdx from the index
+          for (let i = existingIdx + 1; i < pathLen; i++) {
+            delete st.pathIndex[st.path[i]];
+          }
+          st.path.splice(existingIdx + 1);
+          // pathIndex entry for `cell` at existingIdx already correct
+          redraw();
+          return;
+        } else {
+          // ── Outside tolerance: genuine loop closure ──
+          st.path.push(cell);
+          closeCircuit(existingIdx, cell);
+          return;
+        }
       }
+
       st.pathIndex[cell] = st.path.length;
       st.path.push(cell);
     }
+
     redraw();
   }, [closeCircuit, redraw]);
 
