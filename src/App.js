@@ -23,8 +23,6 @@ const MAPBOX_TOKEN =
 
 const FIXED_RES = 12;
 
-// How many recent cells to treat as "jitter zone" — revisiting within this
-// window trims the path back instead of closing a circuit.
 const BACKTRACK_TOLERANCE = 5;
 
 function scoreToFill(score) {
@@ -145,6 +143,7 @@ export default function App() {
     lastCircuitScore: null,
     lastLng: null,
     lastLat: null,
+    gpsCoords: [],      // raw [lng, lat] pairs for the LineString trail
   });
   const mapReady = useRef(false);
   const isRunningRef = useRef(false);
@@ -254,17 +253,13 @@ export default function App() {
         const windowStart = Math.max(0, pathLen - BACKTRACK_TOLERANCE);
 
         if (existingIdx >= windowStart) {
-          // ── Jitter zone: trim path back to this cell, rebuild pathIndex ──
-          // Remove all cells after existingIdx from the index
           for (let i = existingIdx + 1; i < pathLen; i++) {
             delete st.pathIndex[st.path[i]];
           }
           st.path.splice(existingIdx + 1);
-          // pathIndex entry for `cell` at existingIdx already correct
           redraw();
           return;
         } else {
-          // ── Outside tolerance: genuine loop closure ──
           st.path.push(cell);
           closeCircuit(existingIdx, cell);
           return;
@@ -288,11 +283,16 @@ export default function App() {
       lastCircuitScore: null,
       lastLng: null,
       lastLat: null,
+      gpsCoords: [],
     };
     if (mapReady.current && mapRef.current) {
       ["scored", "path", "flash"].forEach((src) =>
         mapRef.current.getSource(src).setData({ type: "FeatureCollection", features: [] })
       );
+      mapRef.current.getSource("gpsTrail").setData({
+        type: "Feature",
+        geometry: { type: "LineString", coordinates: [] },
+      });
     }
     updateStats();
     setInfo("Press Start Run to begin capturing territory with your GPS");
@@ -311,6 +311,15 @@ export default function App() {
     }
 
     if (!isRunningRef.current) return;
+
+    // Append to GPS trail and refresh the LineString layer
+    stateRef.current.gpsCoords.push([lng, lat]);
+    if (mapReady.current && mapRef.current) {
+      mapRef.current.getSource("gpsTrail").setData({
+        type: "Feature",
+        geometry: { type: "LineString", coordinates: stateRef.current.gpsCoords },
+      });
+    }
 
     const cell = (() => {
       try { return window.h3.latLngToCell(lat, lng, FIXED_RES); }
@@ -334,8 +343,13 @@ export default function App() {
         st.pathIndex = {};
         st.lastLng = null;
         st.lastLat = null;
+        st.gpsCoords = [];
         if (mapReady.current && mapRef.current) {
           mapRef.current.getSource("path").setData({ type: "FeatureCollection", features: [] });
+          mapRef.current.getSource("gpsTrail").setData({
+            type: "Feature",
+            geometry: { type: "LineString", coordinates: [] },
+          });
         }
         setInfo("Run started — walk around to capture territory · close a loop to score!");
       } else {
@@ -367,11 +381,32 @@ export default function App() {
         ["scored", "path", "flash"].forEach((id) =>
           map.addSource(id, { type: "geojson", data: { type: "FeatureCollection", features: [] } })
         );
+
+        // GPS trail source
+        map.addSource("gpsTrail", {
+          type: "geojson",
+          data: { type: "Feature", geometry: { type: "LineString", coordinates: [] } },
+        });
+
         map.addLayer({ id: "scored-fill",   type: "fill", source: "scored", paint: { "fill-color": ["get", "fillColor"], "fill-opacity": 1 } });
         map.addLayer({ id: "scored-stroke", type: "line", source: "scored", paint: { "line-color": ["get", "strokeColor"], "line-width": 1.5 } });
         map.addLayer({ id: "path-fill",     type: "fill", source: "path",   paint: { "fill-color": ["get", "fillColor"], "fill-opacity": 1 } });
         map.addLayer({ id: "path-stroke",   type: "line", source: "path",   paint: { "line-color": ["get", "strokeColor"], "line-width": ["get", "strokeWidth"] } });
         map.addLayer({ id: "flash-fill",    type: "fill", source: "flash",  paint: { "fill-color": "rgba(255,255,120,0.6)", "fill-opacity": 1 } });
+
+        // GPS trail layer — drawn on top of everything
+        map.addLayer({
+          id: "gpsTrail-line",
+          type: "line",
+          source: "gpsTrail",
+          paint: {
+            "line-color": "#38bdf8",
+            "line-width": 2.5,
+            "line-opacity": 0.85,
+          },
+          layout: { "line-cap": "round", "line-join": "round" },
+        });
+
         mapReady.current = true;
         updateStats();
 
@@ -518,12 +553,21 @@ export default function App() {
         </div>
 
         <div style={{ position: "absolute", bottom: 74, right: 14, background: "rgba(10,14,20,0.88)", border: "1px solid rgba(99,140,200,0.2)", backdropFilter: "blur(10px)", borderRadius: 10, padding: "10px 14px", zIndex: 20, fontSize: 10, color: "#6b82a0" }}>
-          {[["rgba(239,68,68,0.55)", "#ef4444", "Path start"], ["rgba(59,130,246,0.32)", "#3b82f6", "Active path"], ["rgba(251,191,36,0.7)", "#f59e0b", "Current cell"]].map(([bg, border, label]) => (
+          {[
+            ["rgba(239,68,68,0.55)",  "#ef4444", "Path start"],
+            ["rgba(59,130,246,0.32)", "#3b82f6", "Active path"],
+            ["rgba(251,191,36,0.7)",  "#f59e0b", "Current cell"],
+          ].map(([bg, border, label]) => (
             <div key={label} style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
               <div style={{ width: 13, height: 13, borderRadius: 3, background: bg, border: `1.5px solid ${border}`, flexShrink: 0 }} />
               {label}
             </div>
           ))}
+          {/* GPS trail legend entry */}
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
+            <div style={{ width: 13, height: 3, borderRadius: 2, background: "#38bdf8", flexShrink: 0 }} />
+            GPS trail
+          </div>
           <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
             <div style={{ width: 13, height: 13, borderRadius: "50%", background: isRunning ? "rgba(74,222,128,0.9)" : "rgba(56,189,248,0.9)", border: "2px solid #fff", flexShrink: 0 }} />
             {isRunning ? "You (running)" : "You (idle)"}
