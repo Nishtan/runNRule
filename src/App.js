@@ -129,11 +129,20 @@ function buildPathFeatures(path) {
 
 const SCORE_STEPS = [20, 60, 100, 150, 200, 300];
 
+// GPS options: maximumAge:0 forces fresh fix every time, timeout:0 means no timeout,
+// enableHighAccuracy:true requests the best possible fix regardless of battery cost.
+const GPS_OPTIONS = {
+  enableHighAccuracy: true,
+  timeout: 0,        // never time out — keep hammering for a fix
+  maximumAge: 0,     // never return a cached position
+};
+
 export default function App() {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
   const markerRef = useRef(null);
   const watchIdRef = useRef(null);
+  const intervalPingRef = useRef(null); // extra getCurrentPosition spam loop
   const stateRef = useRef({
     path: [],
     pathIndex: {},
@@ -143,7 +152,7 @@ export default function App() {
     lastCircuitScore: null,
     lastLng: null,
     lastLat: null,
-    gpsCoords: [],      // raw [lng, lat] pairs for the LineString trail
+    gpsCoords: [],
   });
   const mapReady = useRef(false);
   const isRunningRef = useRef(false);
@@ -312,7 +321,6 @@ export default function App() {
 
     if (!isRunningRef.current) return;
 
-    // Append to GPS trail and refresh the LineString layer
     stateRef.current.gpsCoords.push([lng, lat]);
     if (mapReady.current && mapRef.current) {
       mapRef.current.getSource("gpsTrail").setData({
@@ -330,13 +338,15 @@ export default function App() {
 
   const handleGPSError = useCallback((err) => {
     console.warn("GPS error:", err);
-    setInfo("GPS error: " + err.message);
+    // Don't surface TIMEOUT errors from the spam loop — those are expected
+    if (err.code !== err.TIMEOUT) setInfo("GPS error: " + err.message);
   }, []);
 
   const toggleRun = useCallback(() => {
     setIsRunning((prev) => {
       const next = !prev;
       isRunningRef.current = next;
+
       if (next) {
         const st = stateRef.current;
         st.path = [];
@@ -382,7 +392,6 @@ export default function App() {
           map.addSource(id, { type: "geojson", data: { type: "FeatureCollection", features: [] } })
         );
 
-        // GPS trail source
         map.addSource("gpsTrail", {
           type: "geojson",
           data: { type: "Feature", geometry: { type: "LineString", coordinates: [] } },
@@ -394,7 +403,6 @@ export default function App() {
         map.addLayer({ id: "path-stroke",   type: "line", source: "path",   paint: { "line-color": ["get", "strokeColor"], "line-width": ["get", "strokeWidth"] } });
         map.addLayer({ id: "flash-fill",    type: "fill", source: "flash",  paint: { "fill-color": "rgba(255,255,120,0.6)", "fill-opacity": 1 } });
 
-        // GPS trail layer — drawn on top of everything
         map.addLayer({
           id: "gpsTrail-line",
           type: "line",
@@ -446,17 +454,29 @@ export default function App() {
     };
 
     if ("geolocation" in navigator) {
+      // Primary watch — already uses GPS_OPTIONS with enableHighAccuracy + maximumAge:0
       const id = navigator.geolocation.watchPosition(
         handleGPSPosition,
         handleGPSError,
-        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        GPS_OPTIONS,
       );
       watchIdRef.current = id;
+
+      // Secondary spam loop: fire getCurrentPosition as fast as the browser allows.
+      // This bypasses any internal throttle that watchPosition might apply and forces
+      // the chip to produce a new fix on every tick (~250 ms).
+      intervalPingRef.current = setInterval(() => {
+        navigator.geolocation.getCurrentPosition(
+          handleGPSPosition,
+          () => { /* swallow errors from the spam loop silently */ },
+          GPS_OPTIONS,
+        );
+      }, 250);
 
       navigator.geolocation.getCurrentPosition(
         (pos) => initializeMap([pos.coords.longitude, pos.coords.latitude]),
         ()    => initializeMap([72.8777, 19.076]),
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        GPS_OPTIONS,
       );
     } else {
       initializeMap([72.8777, 19.076]);
@@ -464,6 +484,7 @@ export default function App() {
 
     return () => {
       if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
+      if (intervalPingRef.current != null) clearInterval(intervalPingRef.current);
       if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; mapReady.current = false; }
     };
   }, [libsLoaded, handleGPSPosition, handleGPSError, updateStats]);
@@ -563,7 +584,6 @@ export default function App() {
               {label}
             </div>
           ))}
-          {/* GPS trail legend entry */}
           <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
             <div style={{ width: 13, height: 3, borderRadius: 2, background: "#38bdf8", flexShrink: 0 }} />
             GPS trail
