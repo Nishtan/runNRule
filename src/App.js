@@ -22,8 +22,10 @@ const MAPBOX_TOKEN =
   "pk.eyJ1IjoibmlzaHRhbiIsImEiOiJja3ZkcGNmZWg0d25wMm5xd2RkcDBzeHVsIn0.irJll1qHLs4XBFONtsVYFA";
 
 const FIXED_RES = 12;
-
 const BACKTRACK_TOLERANCE = 5;
+
+// Any fix worse than this (after the very first one) gets silently dropped.
+const MAX_ACCURACY_M = 25;
 
 function scoreToFill(score) {
   const t = Math.min(score / 300, 1);
@@ -129,12 +131,10 @@ function buildPathFeatures(path) {
 
 const SCORE_STEPS = [20, 60, 100, 150, 200, 300];
 
-// GPS options: maximumAge:0 forces fresh fix every time, timeout:0 means no timeout,
-// enableHighAccuracy:true requests the best possible fix regardless of battery cost.
 const GPS_OPTIONS = {
   enableHighAccuracy: true,
-  timeout: 0,        // never time out — keep hammering for a fix
-  maximumAge: 0,     // never return a cached position
+  timeout: 0,
+  maximumAge: 0,
 };
 
 export default function App() {
@@ -142,7 +142,7 @@ export default function App() {
   const mapRef = useRef(null);
   const markerRef = useRef(null);
   const watchIdRef = useRef(null);
-  const intervalPingRef = useRef(null); // extra getCurrentPosition spam loop
+  const intervalPingRef = useRef(null);
   const stateRef = useRef({
     path: [],
     pathIndex: {},
@@ -156,6 +156,10 @@ export default function App() {
   });
   const mapReady = useRef(false);
   const isRunningRef = useRef(false);
+
+  // True once the very first GPS fix (any accuracy) has been shown on the map.
+  // After that, fixes worse than MAX_ACCURACY_M are silently dropped.
+  const firstFixShownRef = useRef(false);
 
   const [stats, setStats] = useState({ path: 0, circuits: 0, captured: 0, totalScore: 0, lastCircuitScore: null });
   const [info, setInfo] = useState("Allow location access — your position will appear on the map");
@@ -294,6 +298,8 @@ export default function App() {
       lastLat: null,
       gpsCoords: [],
     };
+    // Reset first-fix flag so the next position (any accuracy) is shown again
+    firstFixShownRef.current = false;
     if (mapReady.current && mapRef.current) {
       ["scored", "path", "flash"].forEach((src) =>
         mapRef.current.getSource(src).setData({ type: "FeatureCollection", features: [] })
@@ -309,18 +315,35 @@ export default function App() {
 
   const handleGPSPosition = useCallback((pos) => {
     const { longitude: lng, latitude: lat, accuracy } = pos.coords;
+
+    // Always update the accuracy badge — even for dropped fixes the user
+    // should see what the chip is reporting.
     setGpsAccuracy(Math.round(accuracy));
-    setGpsReady(true);
 
-    if (markerRef.current) markerRef.current.setLngLat([lng, lat]);
-
-    if (mapRef.current && !mapRef.current._hasCenteredOnUser) {
-      mapRef.current.flyTo({ center: [lng, lat], zoom: 18, duration: 1200 });
-      mapRef.current._hasCenteredOnUser = true;
+    // ── FIRST FIX: show unconditionally so the user sees themselves immediately.
+    //    We do NOT feed this into addCell — it may be wildly inaccurate and the
+    //    user hasn't started a run yet in the typical flow.
+    if (!firstFixShownRef.current) {
+      firstFixShownRef.current = true;
+      setGpsReady(true);
+      if (markerRef.current) markerRef.current.setLngLat([lng, lat]);
+      if (mapRef.current && !mapRef.current._hasCenteredOnUser) {
+        mapRef.current.flyTo({ center: [lng, lat], zoom: 18, duration: 1200 });
+        mapRef.current._hasCenteredOnUser = true;
+      }
+      return;
     }
+
+    // ── SUBSEQUENT FIXES: drop anything worse than MAX_ACCURACY_M.
+    //    The marker stays frozen at its last good position.
+    if (accuracy > MAX_ACCURACY_M) return;
+
+    // Good fix — move the marker.
+    if (markerRef.current) markerRef.current.setLngLat([lng, lat]);
 
     if (!isRunningRef.current) return;
 
+    // Record GPS trail and feed into H3 cell tracking.
     stateRef.current.gpsCoords.push([lng, lat]);
     if (mapReady.current && mapRef.current) {
       mapRef.current.getSource("gpsTrail").setData({
@@ -338,7 +361,6 @@ export default function App() {
 
   const handleGPSError = useCallback((err) => {
     console.warn("GPS error:", err);
-    // Don't surface TIMEOUT errors from the spam loop — those are expected
     if (err.code !== err.TIMEOUT) setInfo("GPS error: " + err.message);
   }, []);
 
@@ -407,11 +429,7 @@ export default function App() {
           id: "gpsTrail-line",
           type: "line",
           source: "gpsTrail",
-          paint: {
-            "line-color": "#38bdf8",
-            "line-width": 2.5,
-            "line-opacity": 0.85,
-          },
+          paint: { "line-color": "#38bdf8", "line-width": 2.5, "line-opacity": 0.85 },
           layout: { "line-cap": "round", "line-join": "round" },
         });
 
@@ -454,23 +472,11 @@ export default function App() {
     };
 
     if ("geolocation" in navigator) {
-      // Primary watch — already uses GPS_OPTIONS with enableHighAccuracy + maximumAge:0
-      const id = navigator.geolocation.watchPosition(
-        handleGPSPosition,
-        handleGPSError,
-        GPS_OPTIONS,
-      );
+      const id = navigator.geolocation.watchPosition(handleGPSPosition, handleGPSError, GPS_OPTIONS);
       watchIdRef.current = id;
 
-      // Secondary spam loop: fire getCurrentPosition as fast as the browser allows.
-      // This bypasses any internal throttle that watchPosition might apply and forces
-      // the chip to produce a new fix on every tick (~250 ms).
       intervalPingRef.current = setInterval(() => {
-        navigator.geolocation.getCurrentPosition(
-          handleGPSPosition,
-          () => { /* swallow errors from the spam loop silently */ },
-          GPS_OPTIONS,
-        );
+        navigator.geolocation.getCurrentPosition(handleGPSPosition, () => {}, GPS_OPTIONS);
       }, 250);
 
       navigator.geolocation.getCurrentPosition(
@@ -507,9 +513,15 @@ export default function App() {
     mapRef.current.flyTo({ center: [lngLat.lng, lngLat.lat], zoom: 18, duration: 800 });
   }, []);
 
+  // Badge colour: amber = waiting, green = good fix, red = fix exists but being dropped
+  const accuracyColor = !gpsReady
+    ? "#fbbf24"
+    : gpsAccuracy <= MAX_ACCURACY_M
+      ? "#4ade80"
+      : "#f87171";
+
   return (
     <div style={{ fontFamily: "'DM Mono','Courier New',monospace", display: "flex", flexDirection: "column", height: "100vh", background: "#0a0e14", color: "#e2eaf5" }}>
-      {/* ── Header ── */}
       <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "9px 16px", background: "#0f1520", borderBottom: "1px solid rgba(99,140,200,0.18)", flexShrink: 0, flexWrap: "wrap" }}>
         <span style={{ fontSize: 12, letterSpacing: 2, textTransform: "uppercase", color: "#22d3ee", fontWeight: 700, whiteSpace: "nowrap" }}>
           H3 · Territory
@@ -520,7 +532,6 @@ export default function App() {
 
         <div style={{ width: 1, height: 22, background: "rgba(99,140,200,0.18)", flexShrink: 0 }} />
 
-        {/* Stats */}
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           {[["Path", stats.path], ["Circuits", stats.circuits], ["Captured", stats.captured], ["Score", stats.totalScore]].map(([label, val]) => (
             <div key={label} style={{ background: "#141c2b", border: "1px solid rgba(99,140,200,0.18)", borderRadius: 6, padding: "4px 10px", fontSize: 11, color: "#6b82a0", whiteSpace: "nowrap" }}>
@@ -534,9 +545,14 @@ export default function App() {
             </div>
           )}
 
-          <div style={{ background: "#141c2b", border: `1px solid ${gpsReady ? "rgba(74,222,128,0.35)" : "rgba(251,191,36,0.35)"}`, borderRadius: 6, padding: "4px 10px", fontSize: 11, color: gpsReady ? "#4ade80" : "#fbbf24", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5 }}>
-            <span style={{ width: 6, height: 6, borderRadius: "50%", background: gpsReady ? "#4ade80" : "#fbbf24", display: "inline-block", flexShrink: 0 }} />
-            {gpsReady ? `GPS ±${gpsAccuracy}m` : "GPS…"}
+          {/* GPS badge — green = good / red = weak and being dropped / amber = waiting */}
+          <div style={{ background: "#141c2b", border: `1px solid ${accuracyColor}55`, borderRadius: 6, padding: "4px 10px", fontSize: 11, color: accuracyColor, whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ width: 6, height: 6, borderRadius: "50%", background: accuracyColor, display: "inline-block", flexShrink: 0 }} />
+            {!gpsReady
+              ? "GPS…"
+              : gpsAccuracy > MAX_ACCURACY_M
+                ? `GPS ±${gpsAccuracy}m (weak)`
+                : `GPS ±${gpsAccuracy}m`}
           </div>
         </div>
 
@@ -553,7 +569,6 @@ export default function App() {
         </button>
       </div>
 
-      {/* ── Map ── */}
       <div style={{ position: "relative", flex: 1 }}>
         {!libsLoaded && (
           <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#6b82a0", fontSize: 13, zIndex: 10 }}>
