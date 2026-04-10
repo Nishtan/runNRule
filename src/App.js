@@ -406,7 +406,6 @@ export default function App() {
   const mapRef = useRef(null);
   const markerRef = useRef(null);
   const watchIdRef = useRef(null);
-  const pingIntervalRef = useRef(null);
   const mapReady = useRef(false);
   const isRunningRef = useRef(false);
 
@@ -763,11 +762,6 @@ export default function App() {
     if ("geolocation" in navigator) {
       const id = navigator.geolocation.watchPosition(handleGPSPosition, handleGPSError, GPS_OPTIONS);
       watchIdRef.current = id;
-
-      // Supplementary interval poll to keep pings frequent
-      pingIntervalRef.current = setInterval(() => {
-        navigator.geolocation.getCurrentPosition(handleGPSPosition, () => { }, GPS_OPTIONS);
-      }, 250);
     }
 
     // Map always starts with world view; no GPS coords needed
@@ -775,7 +769,6 @@ export default function App() {
 
     return () => {
       if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
-      if (pingIntervalRef.current != null) clearInterval(pingIntervalRef.current);
       if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; mapReady.current = false; }
     };
   }, [libsLoaded, handleGPSPosition, handleGPSError, updateStats]);
