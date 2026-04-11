@@ -29,17 +29,15 @@ const H3_RES = 12;
 const BACKTRACK_TOL = 5;
 const MAX_GAP_CELLS = 40;
 
-// Kalman process noise (m²/s²) — how much velocity can change per second.
-// Tuned for walking pace; raise for cycling.
 const Q_ACCEL_VAR = 0.5;
-
-// Max dt (seconds) after which we clamp prediction to avoid covariance blow-up
-// (handles tunnel / app-backgrounded gaps).
 const MAX_DT_S = 5;
 
-// ─── 4×4 Matrix math (column-major flat arrays, length 16) ──────────────────
-// Layout: [m00,m10,m20,m30,  m01,m11,m21,m31,  m02,m12,m22,m32,  m03,m13,m23,m33]
-// i.e. M[row + col*4]
+// ← ZUPT: stillness detection thresholds
+const ZUPT_WINDOW_MS = 300;   // stillness must persist this long
+const ZUPT_ACCEL_TOL = 0.8;   // m/s² deviation from 9.8 allowed (gravity-included path)
+const ZUPT_GYRO_TOL  = 0.05;  // rad/s max rotation allowed
+
+// ─── 4×4 Matrix math ────────────────────────────────────────────────────────
 
 function mat4_zero() { return new Float64Array(16); }
 
@@ -49,7 +47,6 @@ function mat4_identity() {
   return m;
 }
 
-/** C = A × B */
 function mat4_mul(A, B) {
   const C = mat4_zero();
   for (let r = 0; r < 4; r++)
@@ -59,7 +56,6 @@ function mat4_mul(A, B) {
   return C;
 }
 
-/** B = Aᵀ */
 function mat4_T(A) {
   const B = mat4_zero();
   for (let r = 0; r < 4; r++)
@@ -68,37 +64,28 @@ function mat4_T(A) {
   return B;
 }
 
-/** C = A + B */
 function mat4_add(A, B) {
   const C = new Float64Array(16);
   for (let i = 0; i < 16; i++) C[i] = A[i] + B[i];
   return C;
 }
 
-/** C = A - B */
 function mat4_sub(A, B) {
   const C = new Float64Array(16);
   for (let i = 0; i < 16; i++) C[i] = A[i] - B[i];
   return C;
 }
 
-/** Invert a 2×2 matrix stored as [a,b,c,d] (row-major) → returns [a,b,c,d] */
 function mat2_inv(a, b, c, d) {
   const det = a * d - b * c;
-  if (Math.abs(det) < 1e-12) return [1, 0, 0, 1]; // fallback
+  if (Math.abs(det) < 1e-12) return [1, 0, 0, 1];
   return [d / det, -b / det, -c / det, a / det];
 }
-
-// ─── 2-vector helpers ────────────────────────────────────────────────────────
 
 function vec2_sub(a, b) { return [a[0] - b[0], a[1] - b[1]]; }
 
 // ─── Coord helpers ───────────────────────────────────────────────────────────
 
-/**
- * Convert lat/lng to local metric offsets (metres) from an origin.
- * Good for short distances (< a few km).
- */
 function toMetric(lat, lng, originLat, originLng) {
   const R = 6_371_000;
   const dLat = ((lat - originLat) * Math.PI) / 180;
@@ -116,139 +103,54 @@ function fromMetric(x, y, originLat, originLng) {
 }
 
 // ─── Kalman filter ───────────────────────────────────────────────────────────
-//
-// State vector  x = [px, py, vx, vy]ᵀ   (positions and velocities in metres)
-//
-// F (transition):
-//   [1 0 dt  0]
-//   [0 1  0 dt]
-//   [0 0  1  0]
-//   [0 0  0  1]
-//
-// H (observation — we only observe px, py):
-//   [1 0 0 0]
-//   [0 1 0 0]
-//
-// Q (process noise):
-//   Discrete white-noise model for constant-velocity with acceleration noise q:
-//   Q_pos = q·dt⁴/4,  Q_pos_vel = q·dt³/2,  Q_vel = q·dt²
-//   Full 4×4:
-//   [dt⁴/4  0     dt³/2  0    ]
-//   [0      dt⁴/4  0     dt³/2]   × q
-//   [dt³/2  0     dt²    0    ]
-//   [0      dt³/2  0     dt²  ]
-//
-// R (measurement noise):
-//   [σ²  0 ]   where σ = GPS accuracy in metres
-//   [0   σ²]
-//
-// P (state covariance, 4×4 full matrix):
-//   Initialised to diag(σ², σ², 0, 0) — we know position roughly,
-//   velocity is completely unknown but we start it at zero and let it
-//   grow via Q on the first prediction step.
 
 class KalmanGPS {
   constructor(lat, lng, accuracy) {
-    // Origin for metric projection
     this.originLat = lat;
     this.originLng = lng;
-
-    // State vector [px, py, vx, vy] — all zeros at origin
-    this.state = new Float64Array(4); // [0,0,0,0]
-
-    // P — initial covariance
-    // We're fairly sure about position (σ²_pos), completely unsure about velocity.
-    // Off-diagonal pos-vel terms start at 0 (no correlation yet).
+    this.state = new Float64Array(4);
     const s2 = accuracy * accuracy;
     this.P = mat4_zero();
-    this.P[0] = s2; // px-px
-    this.P[5] = s2; // py-py
-    // vx-vx, vy-vy: large uncertainty — let filter figure velocity out
+    this.P[0] = s2;
+    this.P[5] = s2;
     this.P[10] = s2 * 10;
     this.P[15] = s2 * 10;
-    // All cross terms start at 0
-
-    // H is fixed
-    // [1 0 0 0]
-    // [0 1 0 0]
-    // We don't build it as a matrix object; we extract rows inline for speed.
   }
 
-  /**
-   * Predict step — advance state by dt seconds.
-   * Returns predicted [lat, lng] (for optional display; not used for cell mapping).
-   */
   predict(dt) {
     const dtClamped = Math.min(dt, MAX_DT_S);
-
-    // F matrix
     const F = mat4_identity();
-    F[0 + 2 * 4] = dtClamped; // px += vx*dt  → F[row0,col2]
-    F[1 + 3 * 4] = dtClamped; // py += vy*dt  → F[row1,col3]
-
-    // Apply F to state
+    F[0 + 2 * 4] = dtClamped;
+    F[1 + 3 * 4] = dtClamped;
     const [px, py, vx, vy] = this.state;
     this.state[0] = px + vx * dtClamped;
     this.state[1] = py + vy * dtClamped;
-    // velocity unchanged
-
-    // P = F·P·Fᵀ + Q
     const FP = mat4_mul(F, this.P);
     const FPFt = mat4_mul(FP, mat4_T(F));
     const Q = this._buildQ(dtClamped);
     this.P = mat4_add(FPFt, Q);
-
     return this._stateToLatLng();
   }
 
-  /**
-   * Update step — incorporate a GPS measurement.
-   * @param {number} lat
-   * @param {number} lng
-   * @param {number} accuracy  GPS accuracy in metres
-   * @returns {{ lat, lng }}   Filtered position
-   */
   update(lat, lng, accuracy) {
     const [mx, my] = toMetric(lat, lng, this.originLat, this.originLng);
-
-    // Innovation: z - H·x  (H extracts first two components)
     const innov = vec2_sub([mx, my], [this.state[0], this.state[1]]);
-
-    // S = H·P·Hᵀ + R
-    // H·P is just the first two rows of P.
-    // (H·P·Hᵀ) is the top-left 2×2 of P.
     const s2 = accuracy * accuracy;
-    // S (2×2, row-major: [s00, s01, s10, s11])
-    const s00 = this.P[0] + s2; // P[px,px] + R[0,0]
-    const s01 = this.P[4];        // P[px,py]
-    const s10 = this.P[1];        // P[py,px]
-    const s11 = this.P[5] + s2; // P[py,py] + R[1,1]
-
-    // S⁻¹ (2×2)
+    const s00 = this.P[0] + s2;
+    const s01 = this.P[4];
+    const s10 = this.P[1];
+    const s11 = this.P[5] + s2;
     const [si00, si01, si10, si11] = mat2_inv(s00, s01, s10, s11);
-
-    // Kalman gain K = P·Hᵀ·S⁻¹
-    // P·Hᵀ is the first two columns of P (since Hᵀ picks cols 0 and 1).
-    // Result K is 4×2.
-    // K[r,0] = P[r,0]*si00 + P[r,1]*si10
-    // K[r,1] = P[r,0]*si01 + P[r,1]*si11
-    const K = new Float64Array(8); // 4 rows × 2 cols, K[row + col*4]
+    const K = new Float64Array(8);
     for (let r = 0; r < 4; r++) {
-      const p0 = this.P[r + 0 * 4]; // P[r, col0]
-      const p1 = this.P[r + 1 * 4]; // P[r, col1]
+      const p0 = this.P[r + 0 * 4];
+      const p1 = this.P[r + 1 * 4];
       K[r + 0 * 4] = p0 * si00 + p1 * si10;
       K[r + 1 * 4] = p0 * si01 + p1 * si11;
     }
-
-    // State update: x = x + K·innov
     for (let r = 0; r < 4; r++) {
       this.state[r] += K[r + 0 * 4] * innov[0] + K[r + 1 * 4] * innov[1];
     }
-
-    // Covariance update: P = (I - K·H)·P
-    // K·H is 4×4; (K·H)[r,c] = K[r,0]*H[0,c] + K[r,1]*H[1,c]
-    // H[0,c] = 1 if c==0 else 0;  H[1,c] = 1 if c==1 else 0
-    // So (K·H)[r,c] = K[r,0] if c==0, K[r,1] if c==1, else 0
     const KH = mat4_zero();
     for (let r = 0; r < 4; r++) {
       KH[r + 0 * 4] = K[r + 0 * 4];
@@ -256,7 +158,6 @@ class KalmanGPS {
     }
     const I_KH = mat4_sub(mat4_identity(), KH);
     this.P = mat4_mul(I_KH, this.P);
-
     return this._stateToLatLng();
   }
 
@@ -264,24 +165,20 @@ class KalmanGPS {
     return fromMetric(this.state[0], this.state[1], this.originLat, this.originLng);
   }
 
-  /** Discrete white-noise Q for constant-velocity model */
   _buildQ(dt) {
     const q = Q_ACCEL_VAR;
     const dt2 = dt * dt;
     const dt3 = dt2 * dt;
     const dt4 = dt3 * dt;
     const Q = mat4_zero();
-    // px-px, py-py
     Q[0] = q * dt4 / 4;
     Q[5] = q * dt4 / 4;
-    // vx-vx, vy-vy
     Q[10] = q * dt2;
     Q[15] = q * dt2;
-    // px-vx, vx-px  (and py-vy, vy-py)
-    Q[0 + 2 * 4] = q * dt3 / 2; // P[px, vx]
-    Q[2 + 0 * 4] = q * dt3 / 2; // P[vx, px]
-    Q[1 + 3 * 4] = q * dt3 / 2; // P[py, vy]
-    Q[3 + 1 * 4] = q * dt3 / 2; // P[vy, py]
+    Q[0 + 2 * 4] = q * dt3 / 2;
+    Q[2 + 0 * 4] = q * dt3 / 2;
+    Q[1 + 3 * 4] = q * dt3 / 2;
+    Q[3 + 1 * 4] = q * dt3 / 2;
     return Q;
   }
 }
@@ -409,14 +306,14 @@ export default function App() {
   const mapReady = useRef(false);
   const isRunningRef = useRef(false);
 
-  // Kalman filter instance — created on first valid GPS fix
   const kalmanRef = useRef(null);
-  // Timestamp (ms) of previous GPS ping, for computing dt
   const lastPingMsRef = useRef(null);
-  // Has the user seen their first position on the map?
   const firstFixRef = useRef(false);
 
-  // Game state kept in a ref (mutated directly for performance)
+  // ← ZUPT: rolling IMU window + active flag
+  const imuWindowRef = useRef([]);
+  const zuptActiveRef = useRef(false);
+
   const stateRef = useRef({
     path: [],
     pathIndex: {},
@@ -426,7 +323,7 @@ export default function App() {
     lastCircuitScore: null,
     lastLng: null,
     lastLat: null,
-    gpsCoords: [],   // raw Kalman-filtered coords for trail
+    gpsCoords: [],
   });
 
   const [libsLoaded, setLibsLoaded] = useState(false);
@@ -437,6 +334,9 @@ export default function App() {
   const [stats, setStats] = useState({
     path: 0, circuits: 0, captured: 0, totalScore: 0, lastCircuitScore: null,
   });
+
+  // ← ZUPT: track iOS permission state for the UI button
+  const [imuPermission, setImuPermission] = useState("unknown"); // "unknown" | "granted" | "denied" | "notrequired"
 
   // ── Load external libs ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -501,7 +401,6 @@ export default function App() {
     st.totalScore = (st.totalScore || 0) + circuitScore;
     st.lastCircuitScore = circuitScore;
 
-    // Keep cells that came before the loop; closing cell becomes the new tail.
     const preLoop = st.path.slice(0, loopStartIdx);
     st.path = [...preLoop, closingCell];
     st.pathIndex = {};
@@ -543,13 +442,11 @@ export default function App() {
         const windowStart = Math.max(0, pathLen - BACKTRACK_TOL);
 
         if (existingIdx >= windowStart) {
-          // Backtrack — trim path
           for (let i = existingIdx + 1; i < pathLen; i++) delete st.pathIndex[st.path[i]];
           st.path.splice(existingIdx + 1);
           redraw();
           return;
         } else {
-          // Loop detected — close circuit
           st.path.push(cell);
           closeCircuit(existingIdx, cell);
           return;
@@ -572,6 +469,9 @@ export default function App() {
     };
     kalmanRef.current = null;
     lastPingMsRef.current = null;
+    // ← ZUPT: clear IMU state on reset too
+    imuWindowRef.current = [];
+    zuptActiveRef.current = false;
     if (mapReady.current && mapRef.current) {
       ["scored", "path", "flash"].forEach((src) =>
         mapRef.current.getSource(src).setData({ type: "FeatureCollection", features: [] })
@@ -597,6 +497,9 @@ export default function App() {
         st.lastLng = null;
         st.lastLat = null;
         st.gpsCoords = [];
+        // ← ZUPT: clear IMU window when new run starts
+        imuWindowRef.current = [];
+        zuptActiveRef.current = false;
         if (mapReady.current && mapRef.current) {
           mapRef.current.getSource("path").setData({ type: "FeatureCollection", features: [] });
           mapRef.current.getSource("gpsTrail").setData({
@@ -626,7 +529,6 @@ export default function App() {
 
     setGpsAccuracy(Math.round(accuracy));
 
-    // ── FIRST FIX: show unconditionally — initialise Kalman ──────────────────
     if (!firstFixRef.current) {
       firstFixRef.current = true;
       kalmanRef.current = new KalmanGPS(lat, lng, accuracy);
@@ -642,20 +544,25 @@ export default function App() {
       return;
     }
 
-    // ── SUBSEQUENT FIXES: Kalman predict → update ─────────────────────────────
     const kf = kalmanRef.current;
-    const dt = Math.max((nowMs - lastPingMsRef.current) / 1000, 0.01); // seconds, min 10ms
+    const dt = Math.max((nowMs - lastPingMsRef.current) / 1000, 0.01);
     lastPingMsRef.current = nowMs;
 
     kf.predict(dt);
+
+    // ← ZUPT: if ZUPT is active, re-zero velocity after predict
+    // (predict step rebuilds vx/vy via Q — we clamp it back down)
+    if (zuptActiveRef.current) {
+      kf.state[2] = 0;
+      kf.state[3] = 0;
+    }
+
     const { lat: kLat, lng: kLng } = kf.update(lat, lng, accuracy);
 
-    // Move marker to Kalman-filtered position
     if (markerRef.current) markerRef.current.setLngLat([kLng, kLat]);
 
     if (!isRunningRef.current) return;
 
-    // GPS trail (Kalman-filtered)
     stateRef.current.gpsCoords.push([kLng, kLat]);
     if (mapReady.current && mapRef.current) {
       mapRef.current.getSource("gpsTrail").setData({
@@ -664,7 +571,6 @@ export default function App() {
       });
     }
 
-    // Feed filtered position into H3 cell tracking
     const cell = (() => {
       try { return window.h3.latLngToCell(kLat, kLng, H3_RES); } catch { return null; }
     })();
@@ -673,9 +579,107 @@ export default function App() {
 
   const handleGPSError = useCallback((err) => {
     console.warn("GPS error:", err);
-    // Only surface non-timeout errors — timeouts are normal with maximumAge:0
     if (err.code !== err.TIMEOUT)
       setInfo(`GPS error: ${err.message}`);
+  }, []);
+
+  // ← ZUPT: DeviceMotion listener — runs independently of GPS
+  useEffect(() => {
+    const handleMotion = (e) => {
+      const a  = e.acceleration;                 // gravity removed (may be null on some iOS)
+      const ag = e.accelerationIncludingGravity;  // always available
+      const r  = e.rotationRate;
+
+      // Prefer gravity-removed if available, fall back to gravity-included
+      const usingRaw = !a || (a.x == null && a.y == null && a.z == null);
+      const ax = usingRaw ? (ag?.x ?? 0) : (a?.x ?? 0);
+      const ay = usingRaw ? (ag?.y ?? 0) : (a?.y ?? 0);
+      const az = usingRaw ? (ag?.z ?? 0) : (a?.z ?? 0);
+
+      // rotationRate is in deg/s — convert to rad/s
+      const gx = (r?.alpha ?? 0) * (Math.PI / 180);
+      const gy = (r?.beta  ?? 0) * (Math.PI / 180);
+      const gz = (r?.gamma ?? 0) * (Math.PI / 180);
+
+      const now = Date.now();
+      const accelMag = Math.sqrt(ax * ax + ay * ay + az * az);
+
+      // Still check differs based on whether gravity is included or not:
+      // - gravity-included: magnitude should be ~9.81 when phone is stationary
+      // - gravity-removed:  magnitude should be ~0 when phone is stationary
+      const isAccelStill = usingRaw
+        ? Math.abs(accelMag - 9.81) < ZUPT_ACCEL_TOL
+        : accelMag < ZUPT_ACCEL_TOL;
+
+      const gyroMag = Math.sqrt(gx * gx + gy * gy + gz * gz);
+      const isGyroStill = gyroMag < ZUPT_GYRO_TOL;
+
+      // Push into rolling window, trim old samples
+      imuWindowRef.current.push({ t: now, still: isAccelStill && isGyroStill });
+      imuWindowRef.current = imuWindowRef.current.filter(s => now - s.t < ZUPT_WINDOW_MS);
+
+      const windowFull = imuWindowRef.current.length > 3;  // need at least 3 samples
+      const allStill   = imuWindowRef.current.every(s => s.still);
+
+      if (windowFull && allStill) {
+        if (!zuptActiveRef.current) {
+          zuptActiveRef.current = true;
+
+          // ← THE CORE ZUPT: zero velocity + tighten covariance
+          if (kalmanRef.current) {
+            kalmanRef.current.state[2] = 0;    // vx → 0
+            kalmanRef.current.state[3] = 0;    // vy → 0
+            // Tighten velocity variance so filter resists rebuilding speed
+            // from the next noisy GPS ping
+            kalmanRef.current.P[10] = 0.01;   // P[vx,vx] → near zero
+            kalmanRef.current.P[15] = 0.01;   // P[vy,vy] → near zero
+          }
+        }
+      } else {
+        // User is moving again — release the brake
+        zuptActiveRef.current = false;
+      }
+    };
+
+    const startListening = () => {
+      window.addEventListener("devicemotion", handleMotion);
+    };
+
+    // iOS 13+ requires explicit permission from a user gesture
+    if (typeof DeviceMotionEvent !== "undefined" &&
+        typeof DeviceMotionEvent.requestPermission === "function") {
+      // iOS — we can't auto-request, needs user tap (see button in UI below)
+      setImuPermission("needs-request");
+    } else {
+      // Android / desktop — just start listening
+      setImuPermission("notrequired");
+      startListening();
+    }
+
+    return () => window.removeEventListener("devicemotion", handleMotion);
+  }, []);
+
+  // ← ZUPT: iOS permission request — called from button tap
+  const requestIOSMotionPermission = useCallback(async () => {
+    try {
+      const result = await DeviceMotionEvent.requestPermission();
+      if (result === "granted") {
+        setImuPermission("granted");
+        window.addEventListener("devicemotion", (e) => {
+          // Re-attach — the useEffect listener above may not have been added
+          // We trigger a re-mount by toggling, but simpler: just re-add here.
+          // In practice the useEffect cleanup + re-add handles this fine on Android;
+          // on iOS we need this explicit path after the permission grant.
+        });
+        // Easiest: reload the effect by dispatching a custom event
+        // Actually simplest — just reload the page after grant (one-time cost)
+        window.location.reload();
+      } else {
+        setImuPermission("denied");
+      }
+    } catch {
+      setImuPermission("denied");
+    }
   }, []);
 
   // ── Map initialisation ──────────────────────────────────────────────────────
@@ -688,7 +692,7 @@ export default function App() {
         container: mapContainerRef.current,
         style: "mapbox://styles/mapbox/dark-v11",
         center,
-        zoom: center[0] === 0 && center[1] === 0 ? 2 : 18, // world view until GPS
+        zoom: center[0] === 0 && center[1] === 0 ? 2 : 18,
         minZoom: 2,
         maxZoom: 21,
         antialias: true,
@@ -721,7 +725,6 @@ export default function App() {
         mapReady.current = true;
         updateStats();
 
-        // GPS marker element
         const el = document.createElement("div");
         el.style.cssText = `
           width:18px; height:18px; border-radius:50%;
@@ -749,7 +752,6 @@ export default function App() {
           document.head.appendChild(style);
         }
 
-        // Start marker at world-centre; it will jump to user on first fix
         const marker = new window.mapboxgl.Marker({ element: el, anchor: "center" })
           .setLngLat([0, 0])
           .addTo(map);
@@ -758,13 +760,11 @@ export default function App() {
       });
     };
 
-    // GPS watch — always running (even before run starts) for live position dot
     if ("geolocation" in navigator) {
       const id = navigator.geolocation.watchPosition(handleGPSPosition, handleGPSError, GPS_OPTIONS);
       watchIdRef.current = id;
     }
 
-    // Map always starts with world view; no GPS coords needed
     initMap([0, 0]);
 
     return () => {
@@ -786,10 +786,7 @@ export default function App() {
     }
   }, [isRunning]);
 
-  // ── Accuracy badge colour ───────────────────────────────────────────────────
-  const accuracyColor = !gpsReady
-    ? "#fbbf24"
-    : "#4ade80";  // green once Kalman is active (filter handles the rest)
+  const accuracyColor = !gpsReady ? "#fbbf24" : "#4ade80";
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -842,9 +839,35 @@ export default function App() {
             whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5,
           }}>
             <span style={{ width: 6, height: 6, borderRadius: "50%", background: accuracyColor, display: "inline-block", flexShrink: 0 }} />
-            {!gpsReady
-              ? "GPS…"
-              : `GPS ±${gpsAccuracy}m · Kalman ✓`}
+            {!gpsReady ? "GPS…" : `GPS ±${gpsAccuracy}m · Kalman ✓`}
+          </div>
+
+          {/* ← ZUPT: IMU status badge */}
+          <div style={{
+            background: "#141c2b",
+            border: `1px solid ${
+              imuPermission === "granted" || imuPermission === "notrequired"
+                ? "rgba(167,139,250,0.5)"
+                : imuPermission === "denied"
+                ? "rgba(239,68,68,0.4)"
+                : "rgba(251,191,36,0.4)"
+            }`,
+            borderRadius: 6, padding: "4px 10px", fontSize: 11,
+            color: imuPermission === "granted" || imuPermission === "notrequired"
+              ? "#a78bfa"
+              : imuPermission === "denied" ? "#f87171" : "#fbbf24",
+            whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5,
+          }}>
+            <span style={{
+              width: 6, height: 6, borderRadius: "50%", display: "inline-block", flexShrink: 0,
+              background: imuPermission === "granted" || imuPermission === "notrequired"
+                ? "#a78bfa" : imuPermission === "denied" ? "#f87171" : "#fbbf24",
+            }} />
+            {imuPermission === "notrequired" && "IMU ✓ ZUPT active"}
+            {imuPermission === "granted"     && "IMU ✓ ZUPT active"}
+            {imuPermission === "denied"      && "IMU denied"}
+            {imuPermission === "needs-request" && "IMU needs permission"}
+            {imuPermission === "unknown"     && "IMU…"}
           </div>
         </div>
 
@@ -866,6 +889,20 @@ export default function App() {
         >
           {isRunning ? "⏹ Stop Run" : "▶ Start Run"}
         </button>
+
+        {/* ← ZUPT: iOS permission button — only visible when needed */}
+        {imuPermission === "needs-request" && (
+          <button
+            onClick={requestIOSMotionPermission}
+            style={{
+              fontSize: 11, padding: "5px 14px", borderRadius: 6,
+              border: "1px solid rgba(167,139,250,0.5)", background: "rgba(167,139,250,0.1)",
+              color: "#a78bfa", cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap",
+            }}
+          >
+            Enable IMU
+          </button>
+        )}
 
         <button
           onClick={reCenterOnUser}
@@ -920,7 +957,7 @@ export default function App() {
             whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 8,
           }}>
             <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#4ade80", display: "inline-block", animation: "gpsPulseRun 1.4s infinite" }} />
-            Tracking · Kalman-filtered GPS
+            Tracking · Kalman + ZUPT
           </div>
         )}
 
